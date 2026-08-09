@@ -173,7 +173,7 @@ const DEFAULT_SCHEDULE = [
 const DEFAULT_SETTINGS = {
   schedule: DEFAULT_SCHEDULE,
   volumeLevel: 1,
-  startDate: new Date().toISOString().split("T")[0],
+  startDate: todayISO(),
   lastProgressionCheck: null,
 };
 
@@ -184,7 +184,14 @@ const SETTINGS_STORAGE_KEY = "terpsichore_settings";
 // HELPERS
 // ============================================================
 
-const todayISO = () => new Date().toISOString().split("T")[0];
+// Local calendar date, not UTC. toISOString() would roll over to tomorrow for
+// anyone behind UTC during evening hours — exactly when sessions get logged.
+function todayISO() {
+  const d = new Date();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
 
 const formatDate = (iso) => {
   const d = new Date(iso + "T12:00:00");
