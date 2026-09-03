@@ -172,6 +172,9 @@ const DEFAULT_SCHEDULE = [
 
 const DEFAULT_SETTINGS = {
   schedule: DEFAULT_SCHEDULE,
+  // One-off day swaps, keyed by ISO date. These override the weekly schedule for
+  // a single day only — the recurring plan itself is never rewritten.
+  overrides: {},
   volumeLevel: 1,
   startDate: todayISO(),
   lastProgressionCheck: null,
@@ -208,6 +211,14 @@ const dayOfWeekIndex = (iso) => {
   const js = d.getDay(); // 0=Sun, 1=Mon, ...
   return (js + 6) % 7;
 };
+
+const scheduledDayTypeFor = (settings, iso) =>
+  settings.schedule[dayOfWeekIndex(iso)];
+
+// What the app should actually prescribe for a date: a one-off swap if one was
+// made for that date, otherwise the recurring weekly schedule.
+const effectiveDayTypeFor = (settings, iso) =>
+  settings.overrides?.[iso] ?? scheduledDayTypeFor(settings, iso);
 
 // ============================================================
 // STORAGE  (localStorage — works in any browser)
@@ -601,17 +612,12 @@ function SessionLogSummary({ session }) {
   );
 }
 
-function TodayView({
-  todayDayType,
-  todaySession,
-  schedule,
-  volume,
-  onLog,
-  onSwapDay,
-  onUndo,
-}) {
+function TodayView({ todaySession, settings, volume, onLog, onSwapDay, onUndo }) {
   const [isLogging, setIsLogging] = useState(false);
   const [isSwapping, setIsSwapping] = useState(false);
+  const scheduledDayType = scheduledDayTypeFor(settings, todayISO());
+  const todayDayType = effectiveDayTypeFor(settings, todayISO());
+  const isSwapped = todayDayType !== scheduledDayType;
 
   if (todaySession) {
     return (
@@ -634,7 +640,7 @@ function TodayView({
   if (isLogging) {
     return (
       <LogSessionForm
-        schedule={schedule}
+        settings={settings}
         volume={volume}
         onCancel={() => setIsLogging(false)}
         onSubmit={(data) => {
@@ -663,7 +669,9 @@ function TodayView({
             SWAP TODAY'S SESSION
           </h3>
           <p style={{ color: COLORS.muted }} className="text-sm mb-4">
-            Override today's prescribed session. Useful when you're not feeling up to the planned intensity.
+            Override today's prescribed session. Useful when you're not feeling up
+            to the planned intensity. This affects today only — your weekly
+            schedule stays as-is.
           </p>
           <div className="space-y-2">
             {Object.keys(DAY_TYPES).map((dt) => {
@@ -707,6 +715,27 @@ function TodayView({
     <div className="px-6">
       <DayTypeCard dayType={todayDayType} volume={volume} large />
 
+      {isSwapped && (
+        <div
+          style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
+          className="text-xs tracking-wider mt-2 flex items-center gap-2"
+        >
+          <span>
+            SWAPPED FROM{" "}
+            <span style={{ color: DAY_TYPES[scheduledDayType].accent }}>
+              {DAY_TYPES[scheduledDayType].name.toUpperCase()}
+            </span>{" "}
+            · TODAY ONLY
+          </span>
+          <button
+            onClick={() => onSwapDay(null)}
+            className="hover:text-white transition-colors underline"
+          >
+            REVERT
+          </button>
+        </div>
+      )}
+
       {todayDayType !== "rest" ? (
         <div className="grid grid-cols-2 gap-3 mt-4">
           <button
@@ -738,7 +767,7 @@ function TodayView({
           <button
             onClick={() =>
               onLog({
-                scheduledDayType: "rest",
+                scheduledDayType,
                 actualDayType: "rest",
                 completed: true,
                 notes: "",
@@ -774,17 +803,18 @@ function TodayView({
 function LogSessionForm({
   defaultDate = todayISO(),
   editableDate = false,
-  schedule,
+  settings,
   sessions = [],
   volume,
   onCancel,
   onSubmit,
 }) {
   const [logDate, setLogDate] = useState(defaultDate);
-  const scheduledDayType = schedule[dayOfWeekIndex(logDate)];
+  const scheduledDayType = scheduledDayTypeFor(settings, logDate);
+  const effectiveDayType = effectiveDayTypeFor(settings, logDate);
   const existingSession = sessions.find((s) => s.date === logDate);
 
-  const [actualDayType, setActualDayType] = useState(scheduledDayType);
+  const [actualDayType, setActualDayType] = useState(effectiveDayType);
   const [completed, setCompleted] = useState(true);
   const [rpe, setRpe] = useState(7);
   const [wipeout, setWipeout] = useState("");
@@ -793,10 +823,10 @@ function LogSessionForm({
   const [sleepQuality, setSleepQuality] = useState("");
   const [notes, setNotes] = useState("");
 
-  // Reset actualDayType to match the schedule whenever the date changes
+  // Reset actualDayType to match the prescribed session whenever the date changes
   useEffect(() => {
-    setActualDayType(scheduledDayType);
-  }, [logDate, scheduledDayType]);
+    setActualDayType(effectiveDayType);
+  }, [logDate, effectiveDayType]);
 
   const isLiftOrRest = ["rest", "upperLift", "lowerLift"].includes(actualDayType);
 
@@ -865,6 +895,14 @@ function LogSessionForm({
                 <span style={{ color: DAY_TYPES[scheduledDayType].accent }}>
                   {DAY_TYPES[scheduledDayType].name}
                 </span>
+                {effectiveDayType !== scheduledDayType && (
+                  <>
+                    {" "}· Swapped to{" "}
+                    <span style={{ color: DAY_TYPES[effectiveDayType].accent }}>
+                      {DAY_TYPES[effectiveDayType].name}
+                    </span>
+                  </>
+                )}
               </p>
               {existingSession && (
                 <div
@@ -1154,7 +1192,7 @@ function LogSessionForm({
   );
 }
 
-function HistoryView({ sessions, schedule, volume, onLog }) {
+function HistoryView({ sessions, settings, volume, onLog }) {
   const [isLoggingPast, setIsLoggingPast] = useState(false);
   const recent = sessions.slice(-21).reverse();
 
@@ -1163,7 +1201,7 @@ function HistoryView({ sessions, schedule, volume, onLog }) {
       <LogSessionForm
         defaultDate={todayISO()}
         editableDate={true}
-        schedule={schedule}
+        settings={settings}
         sessions={sessions}
         volume={volume}
         onCancel={() => setIsLoggingPast(false)}
@@ -1810,11 +1848,6 @@ export default function App() {
     })();
   }, []);
 
-  const todayDayType = useMemo(() => {
-    const idx = dayOfWeekIndex(todayISO());
-    return settings.schedule[idx];
-  }, [settings.schedule]);
-
   const todaySession = useMemo(
     () => sessions.find((s) => s.date === todayISO()),
     [sessions]
@@ -1841,13 +1874,13 @@ export default function App() {
     await STORAGE.saveSessions(updated);
   };
 
+  // Swapping affects today only; a null type clears the swap. The weekly
+  // schedule is never touched.
   const handleSwapDay = (newType) => {
-    const newSchedule = [...settings.schedule];
-    const idx = dayOfWeekIndex(todayISO());
-    newSchedule[idx] = newType;
-    const newSettings = { ...settings, schedule: newSchedule };
-    setSettings(newSettings);
-    STORAGE.saveSettings(newSettings);
+    const overrides = { ...settings.overrides };
+    if (newType === null) delete overrides[todayISO()];
+    else overrides[todayISO()] = newType;
+    return handleUpdateSettings({ ...settings, overrides });
   };
 
   const handleUndo = async () => {
@@ -1904,9 +1937,8 @@ export default function App() {
       <div className="pb-12 max-w-2xl mx-auto">
         {view === "today" && (
           <TodayView
-            todayDayType={todayDayType}
             todaySession={todaySession}
-            schedule={settings.schedule}
+            settings={settings}
             volume={volume}
             onLog={handleLog}
             onSwapDay={handleSwapDay}
@@ -1916,7 +1948,7 @@ export default function App() {
         {view === "history" && (
           <HistoryView
             sessions={sessions}
-            schedule={settings.schedule}
+            settings={settings}
             volume={volume}
             onLog={handleLog}
           />
