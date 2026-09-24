@@ -220,6 +220,12 @@ const scheduledDayTypeFor = (settings, iso) =>
 const effectiveDayTypeFor = (settings, iso) =>
   settings.overrides?.[iso] ?? scheduledDayTypeFor(settings, iso);
 
+// A date input yields "" while cleared or partially typed, and `max` only
+// constrains the picker, not typed values. Only complete, non-future dates can
+// be logged. ISO dates compare correctly as strings.
+const isLoggableDate = (value) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(value) && value <= todayISO();
+
 // ============================================================
 // STORAGE  (localStorage — works in any browser)
 // ============================================================
@@ -809,10 +815,12 @@ function LogSessionForm({
   onCancel,
   onSubmit,
 }) {
-  const [logDate, setLogDate] = useState(defaultDate);
-  const scheduledDayType = scheduledDayTypeFor(settings, logDate);
-  const effectiveDayType = effectiveDayTypeFor(settings, logDate);
-  const existingSession = sessions.find((s) => s.date === logDate);
+  const [dateInput, setDateInput] = useState(defaultDate);
+  // null while the date field holds something that can't be logged.
+  const logDate = isLoggableDate(dateInput) ? dateInput : null;
+  const scheduledDayType = logDate && scheduledDayTypeFor(settings, logDate);
+  const effectiveDayType = logDate && effectiveDayTypeFor(settings, logDate);
+  const existingSession = logDate && sessions.find((s) => s.date === logDate);
 
   const [actualDayType, setActualDayType] = useState(effectiveDayType);
   const [completed, setCompleted] = useState(true);
@@ -825,7 +833,7 @@ function LogSessionForm({
 
   // Reset actualDayType to match the prescribed session whenever the date changes
   useEffect(() => {
-    setActualDayType(effectiveDayType);
+    if (effectiveDayType) setActualDayType(effectiveDayType);
   }, [logDate, effectiveDayType]);
 
   const isLiftOrRest = ["rest", "upperLift", "lowerLift"].includes(actualDayType);
@@ -876,8 +884,8 @@ function LogSessionForm({
               </label>
               <input
                 type="date"
-                value={logDate}
-                onChange={(e) => setLogDate(e.target.value)}
+                value={dateInput}
+                onChange={(e) => setDateInput(e.target.value)}
                 max={todayISO()}
                 style={{
                   backgroundColor: COLORS.surfaceLight,
@@ -887,23 +895,33 @@ function LogSessionForm({
                 }}
                 className="w-full p-2"
               />
-              <p
-                style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
-                className="text-xs mt-1"
-              >
-                {formatDate(logDate).toUpperCase()} · Scheduled:{" "}
-                <span style={{ color: DAY_TYPES[scheduledDayType].accent }}>
-                  {DAY_TYPES[scheduledDayType].name}
-                </span>
-                {effectiveDayType !== scheduledDayType && (
-                  <>
-                    {" "}· Swapped to{" "}
-                    <span style={{ color: DAY_TYPES[effectiveDayType].accent }}>
-                      {DAY_TYPES[effectiveDayType].name}
-                    </span>
-                  </>
-                )}
-              </p>
+              {logDate ? (
+                <p
+                  style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
+                  className="text-xs mt-1"
+                >
+                  {formatDate(logDate).toUpperCase()} · Scheduled:{" "}
+                  <span style={{ color: DAY_TYPES[scheduledDayType].accent }}>
+                    {DAY_TYPES[scheduledDayType].name}
+                  </span>
+                  {effectiveDayType !== scheduledDayType && (
+                    <>
+                      {" "}· Swapped to{" "}
+                      <span style={{ color: DAY_TYPES[effectiveDayType].accent }}>
+                        {DAY_TYPES[effectiveDayType].name}
+                      </span>
+                    </>
+                  )}
+                </p>
+              ) : (
+                <div
+                  style={{ color: "#fbbf24", fontFamily: "'JetBrains Mono', monospace" }}
+                  className="text-xs mt-1 flex items-center gap-2"
+                >
+                  <AlertTriangle size={12} />
+                  Enter a date on or before today.
+                </div>
+              )}
               {existingSession && (
                 <div
                   style={{ color: "#fbbf24", fontFamily: "'JetBrains Mono', monospace" }}
@@ -1175,12 +1193,13 @@ function LogSessionForm({
             </button>
             <button
               onClick={handleSubmit}
+              disabled={!logDate}
               style={{
                 backgroundColor: COLORS.accent,
                 color: "#0a0a14",
                 fontFamily: "'JetBrains Mono', monospace",
               }}
-              className="py-3 text-sm tracking-wider hover:opacity-90 transition-opacity flex items-center justify-center gap-2"
+              className="py-3 text-sm tracking-wider hover:opacity-90 transition-opacity flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Save size={14} />
               SAVE
