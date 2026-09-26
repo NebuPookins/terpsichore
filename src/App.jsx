@@ -223,18 +223,94 @@ const effectiveDayTypeFor = (settings, iso) =>
 // A date input yields "" while cleared or partially typed, and `max` only
 // constrains the picker, not typed values. Only complete, non-future dates can
 // be logged. ISO dates compare correctly as strings.
-const isLoggableDate = (value) =>
-  /^\d{4}-\d{2}-\d{2}$/.test(value) && value <= todayISO();
+const isISODate = (value) =>
+  typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+const isLoggableDate = (value) => isISODate(value) && value <= todayISO();
+
+// Sessions are stored oldest-first; insights depend on that order.
+const byDate = (a, b) => a.date.localeCompare(b.date);
+
+// ============================================================
+// BACKUP PARSING
+// ============================================================
+
+const isDayType = (value) => Object.hasOwn(DAY_TYPES, value);
+
+const isPlainObject = (value) =>
+  value != null && typeof value === "object" && !Array.isArray(value);
+
+// Rendering indexes DAY_TYPES and VOLUME_LEVELS by these fields directly, so
+// anything outside those tables would crash the app on every load. These
+// parsers guard both ways data enters: restoring a backup and reading
+// localStorage. Each returns { ok: true, value } or { ok: false, error }.
+const ok = (value) => ({ ok: true, value });
+const fail = (error) => ({ ok: false, error });
+
+function parseSessions(raw) {
+  if (!Array.isArray(raw)) return fail("'sessions' must be an array");
+  const badIndex = raw.findIndex(
+    (s) =>
+      !isPlainObject(s) ||
+      !isISODate(s.date) ||
+      !isDayType(s.actualDayType) ||
+      !isDayType(s.scheduledDayType)
+  );
+  if (badIndex !== -1)
+    return fail(`session #${badIndex + 1} needs a YYYY-MM-DD date and valid session types`);
+  return ok([...raw].sort(byDate));
+}
+
+function parseSettings(raw) {
+  if (!isPlainObject(raw)) return fail("'settings' is missing");
+  const settings = { ...DEFAULT_SETTINGS, ...raw };
+  const { schedule, overrides, volumeLevel } = settings;
+  if (!Number.isInteger(volumeLevel) || !Object.hasOwn(VOLUME_LEVELS, volumeLevel))
+    return fail("'volumeLevel' must be an integer from 1 to 5");
+  if (!Array.isArray(schedule) || schedule.length !== 7 || !schedule.every(isDayType))
+    return fail("'schedule' must list 7 valid session types");
+  if (
+    !isPlainObject(overrides) ||
+    !Object.entries(overrides).every(([date, dt]) => isISODate(date) && isDayType(dt))
+  )
+    return fail("'overrides' must map YYYY-MM-DD dates to session types");
+  return ok(settings);
+}
+
+function parseBackup(data) {
+  if (!isPlainObject(data)) return fail("expected a JSON object");
+  const sessions = parseSessions(data.sessions);
+  if (!sessions.ok) return sessions;
+  const settings = parseSettings(data.settings);
+  if (!settings.ok) return settings;
+  return ok({ sessions: sessions.value, settings: settings.value });
+}
 
 // ============================================================
 // STORAGE  (localStorage — works in any browser)
 // ============================================================
 
+// Stored data that fails to parse falls back to the default, but the raw text
+// is first copied aside so a later save can't destroy it.
+function readStored(key, parse, fallback) {
+  const raw = localStorage.getItem(key);
+  if (raw == null) return fallback;
+  let result;
+  try {
+    result = parse(JSON.parse(raw));
+  } catch (e) {
+    result = fail(e.message);
+  }
+  if (result.ok) return result.value;
+  console.warn(`Ignoring invalid ${key} (${result.error}); raw copy kept in ${key}_invalid`);
+  localStorage.setItem(`${key}_invalid`, raw);
+  return fallback;
+}
+
 const STORAGE = {
   async getSessions() {
     try {
-      const r = localStorage.getItem(SESSION_STORAGE_KEY);
-      return r ? JSON.parse(r) : [];
+      return readStored(SESSION_STORAGE_KEY, parseSessions, []);
     } catch {
       return [];
     }
@@ -249,8 +325,7 @@ const STORAGE = {
   },
   async getSettings() {
     try {
-      const r = localStorage.getItem(SETTINGS_STORAGE_KEY);
-      return r ? { ...DEFAULT_SETTINGS, ...JSON.parse(r) } : DEFAULT_SETTINGS;
+      return readStored(SETTINGS_STORAGE_KEY, parseSettings, DEFAULT_SETTINGS);
     } catch {
       return DEFAULT_SETTINGS;
     }
@@ -1558,16 +1633,14 @@ function SettingsView({ settings, onUpdate, sessions, onResetData, onImportData 
     setImportStatus(null);
     try {
       const data = JSON.parse(importText);
-      if (!Array.isArray(data.sessions)) {
-        setImportStatus({ ok: false, msg: "Invalid format: 'sessions' must be an array" });
+      const backup = parseBackup(data);
+      if (!backup.ok) {
+        setImportStatus({ ok: false, msg: `Invalid format: ${backup.error}` });
         return;
       }
-      if (!data.settings || typeof data.settings !== "object") {
-        setImportStatus({ ok: false, msg: "Invalid format: 'settings' is missing" });
-        return;
-      }
-      onImportData(data);
-      setImportStatus({ ok: true, msg: `Imported ${data.sessions.length} session${data.sessions.length !== 1 ? "s" : ""}` });
+      const { sessions: imported } = backup.value;
+      onImportData(backup.value);
+      setImportStatus({ ok: true, msg: `Imported ${imported.length} session${imported.length !== 1 ? "s" : ""}` });
       setImportText("");
       setConfirmImport(false);
     } catch (e) {
@@ -1888,7 +1961,7 @@ export default function App() {
     };
     const updated = sessions.filter((s) => s.date !== sessionDate);
     updated.push(newSession);
-    updated.sort((a, b) => a.date.localeCompare(b.date));
+    updated.sort(byDate);
     setSessions(updated);
     await STORAGE.saveSessions(updated);
   };
@@ -1920,9 +1993,8 @@ export default function App() {
     await STORAGE.saveSettings(DEFAULT_SETTINGS);
   };
 
-  const handleImportData = async (data) => {
-    const importedSessions = data.sessions || [];
-    const importedSettings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
+  // Expects a backup already validated by parseBackup.
+  const handleImportData = async ({ sessions: importedSessions, settings: importedSettings }) => {
     setSessions(importedSessions);
     setSettings(importedSettings);
     await STORAGE.saveSessions(importedSessions);
