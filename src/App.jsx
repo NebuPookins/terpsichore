@@ -344,6 +344,21 @@ const STORAGE = {
 // ADAPTATION LOGIC
 // ============================================================
 
+const mean = (xs) =>
+  xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+
+// Compares the older half of the wipeouts to the newer half. With fewer than
+// two points one half is empty, so there is nothing to compare — reporting a
+// trend there would flag a single logged wipeout as "worsening".
+function wipeoutTrend(wipeouts) {
+  if (wipeouts.length < 2) return "neutral";
+  const half = Math.floor(wipeouts.length / 2);
+  const change = mean(wipeouts.slice(half)) - mean(wipeouts.slice(0, half));
+  if (change < -3) return "improving";
+  if (change > 3) return "worsening";
+  return "neutral";
+}
+
 function computeInsights(sessions, settings) {
   const DDR_TYPES = ["peak", "stamina", "technique"];
   const recent = sessions
@@ -365,23 +380,8 @@ function computeInsights(sessions, settings) {
   const wipeouts = recent
     .map((s) => s.wipeoutMinutes)
     .filter((w) => w != null);
-  const avgWipeout = wipeouts.length
-    ? wipeouts.reduce((a, b) => a + b, 0) / wipeouts.length
-    : null;
-
-  // Trend: compare first half to second half
-  const half = Math.floor(wipeouts.length / 2);
-  const firstHalf = wipeouts.slice(0, half);
-  const secondHalf = wipeouts.slice(half);
-  const firstAvg = firstHalf.length
-    ? firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length
-    : 0;
-  const secondAvg = secondHalf.length
-    ? secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length
-    : 0;
-  let trend = "neutral";
-  if (secondAvg < firstAvg - 3) trend = "improving";
-  else if (secondAvg > firstAvg + 3) trend = "worsening";
+  const avgWipeout = mean(wipeouts);
+  const trend = wipeoutTrend(wipeouts);
 
   // Recovery indicators
   const recent5 = recent.slice(-5);
@@ -396,9 +396,7 @@ function computeInsights(sessions, settings) {
   const sleepScores = recent
     .map((s) => s.sleepQuality)
     .filter((x) => x != null);
-  const avgSleep = sleepScores.length
-    ? sleepScores.reduce((a, b) => a + b, 0) / sleepScores.length
-    : null;
+  const avgSleep = mean(sleepScores);
 
   const shouldDeload = badSessions >= 3;
 
