@@ -196,6 +196,26 @@ function todayISO() {
   return `${d.getFullYear()}-${month}-${day}`;
 }
 
+// The current local date as React state. The app is often left open across
+// midnight (e.g. a phone tab), so anything keyed to "today" must re-render when
+// the date rolls over rather than reading todayISO() once and caching it.
+// Background tabs throttle timers, so also re-check whenever the page is shown.
+function useToday() {
+  const [today, setToday] = useState(todayISO);
+  useEffect(() => {
+    const sync = () => setToday(todayISO());
+    const interval = setInterval(sync, 60_000);
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
+    };
+  }, []);
+  return today;
+}
+
 const formatDate = (iso) => {
   const d = new Date(iso + "T12:00:00");
   return d.toLocaleDateString("en-US", {
@@ -226,7 +246,7 @@ const effectiveDayTypeFor = (settings, iso) =>
 const isISODate = (value) =>
   typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
 
-const isLoggableDate = (value) => isISODate(value) && value <= todayISO();
+const isLoggableDate = (value, today) => isISODate(value) && value <= today;
 
 // Sessions are stored oldest-first; insights depend on that order.
 const byDate = (a, b) => a.date.localeCompare(b.date);
@@ -471,7 +491,7 @@ const COLORS = {
   accent2: "#3ee5ff",
 };
 
-function Header({ view, setView }) {
+function Header({ view, setView, today }) {
   const tabs = [
     { id: "today", label: "Today", Icon: Home },
     { id: "history", label: "History", Icon: HistoryIcon },
@@ -500,7 +520,7 @@ function Header({ view, setView }) {
             style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
             className="text-xs tracking-wider mt-1"
           >
-            DDR TRAINING LOG · {formatDate(todayISO()).toUpperCase()}
+            DDR TRAINING LOG · {formatDate(today).toUpperCase()}
           </p>
         </div>
       </div>
@@ -691,11 +711,11 @@ function SessionLogSummary({ session }) {
   );
 }
 
-function TodayView({ todaySession, settings, volume, onLog, onSwapDay, onUndo }) {
+function TodayView({ today, todaySession, settings, volume, onLog, onSwapDay, onUndo }) {
   const [isLogging, setIsLogging] = useState(false);
   const [isSwapping, setIsSwapping] = useState(false);
-  const scheduledDayType = scheduledDayTypeFor(settings, todayISO());
-  const todayDayType = effectiveDayTypeFor(settings, todayISO());
+  const scheduledDayType = scheduledDayTypeFor(settings, today);
+  const todayDayType = effectiveDayTypeFor(settings, today);
   const isSwapped = todayDayType !== scheduledDayType;
 
   if (todaySession) {
@@ -719,6 +739,7 @@ function TodayView({ todaySession, settings, volume, onLog, onSwapDay, onUndo })
   if (isLogging) {
     return (
       <LogSessionForm
+        today={today}
         settings={settings}
         volume={volume}
         onCancel={() => setIsLogging(false)}
@@ -846,6 +867,7 @@ function TodayView({ todaySession, settings, volume, onLog, onSwapDay, onUndo })
           <button
             onClick={() =>
               onLog({
+                date: today,
                 scheduledDayType,
                 actualDayType: "rest",
                 completed: true,
@@ -880,7 +902,7 @@ function TodayView({ todaySession, settings, volume, onLog, onSwapDay, onUndo })
 }
 
 function LogSessionForm({
-  defaultDate = todayISO(),
+  today,
   editableDate = false,
   settings,
   sessions = [],
@@ -888,9 +910,9 @@ function LogSessionForm({
   onCancel,
   onSubmit,
 }) {
-  const [dateInput, setDateInput] = useState(defaultDate);
+  const [dateInput, setDateInput] = useState(today);
   // null while the date field holds something that can't be logged.
-  const logDate = isLoggableDate(dateInput) ? dateInput : null;
+  const logDate = isLoggableDate(dateInput, today) ? dateInput : null;
   const scheduledDayType = logDate && scheduledDayTypeFor(settings, logDate);
   const effectiveDayType = logDate && effectiveDayTypeFor(settings, logDate);
   const existingSession = logDate && sessions.find((s) => s.date === logDate);
@@ -959,7 +981,7 @@ function LogSessionForm({
                 type="date"
                 value={dateInput}
                 onChange={(e) => setDateInput(e.target.value)}
-                max={todayISO()}
+                max={today}
                 style={{
                   backgroundColor: COLORS.surfaceLight,
                   color: COLORS.text,
@@ -1284,14 +1306,14 @@ function LogSessionForm({
   );
 }
 
-function HistoryView({ sessions, settings, volume, onLog }) {
+function HistoryView({ today, sessions, settings, volume, onLog }) {
   const [isLoggingPast, setIsLoggingPast] = useState(false);
   const recent = sessions.slice(-21).reverse();
 
   if (isLoggingPast) {
     return (
       <LogSessionForm
-        defaultDate={todayISO()}
+        today={today}
         editableDate={true}
         settings={settings}
         sessions={sessions}
@@ -1925,6 +1947,7 @@ export default function App() {
   const [sessions, setSessions] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [loaded, setLoaded] = useState(false);
+  const today = useToday();
 
   useEffect(() => {
     (async () => {
@@ -1939,8 +1962,8 @@ export default function App() {
   }, []);
 
   const todaySession = useMemo(
-    () => sessions.find((s) => s.date === todayISO()),
-    [sessions]
+    () => sessions.find((s) => s.date === today),
+    [sessions, today]
   );
 
   const volume = VOLUME_LEVELS[settings.volumeLevel];
@@ -1950,14 +1973,11 @@ export default function App() {
     [sessions, settings]
   );
 
+  // Callers always supply data.date; logging a session replaces any existing
+  // session on that date.
   const handleLog = async (data) => {
-    const sessionDate = data.date || todayISO();
-    const newSession = {
-      ...data,
-      date: sessionDate,
-      volumeLevel: settings.volumeLevel,
-    };
-    const updated = sessions.filter((s) => s.date !== sessionDate);
+    const newSession = { ...data, volumeLevel: settings.volumeLevel };
+    const updated = sessions.filter((s) => s.date !== data.date);
     updated.push(newSession);
     updated.sort(byDate);
     setSessions(updated);
@@ -1968,13 +1988,13 @@ export default function App() {
   // schedule is never touched.
   const handleSwapDay = (newType) => {
     const overrides = { ...settings.overrides };
-    if (newType === null) delete overrides[todayISO()];
-    else overrides[todayISO()] = newType;
+    if (newType === null) delete overrides[today];
+    else overrides[today] = newType;
     return handleUpdateSettings({ ...settings, overrides });
   };
 
   const handleUndo = async () => {
-    const updated = sessions.filter((s) => s.date !== todayISO());
+    const updated = sessions.filter((s) => s.date !== today);
     setSessions(updated);
     await STORAGE.saveSessions(updated);
   };
@@ -2021,11 +2041,12 @@ export default function App() {
         fontFamily: "'Manrope', sans-serif",
       }}
     >
-      <Header view={view} setView={setView} />
+      <Header view={view} setView={setView} today={today} />
 
       <div className="pb-12 max-w-2xl mx-auto">
         {view === "today" && (
           <TodayView
+            today={today}
             todaySession={todaySession}
             settings={settings}
             volume={volume}
@@ -2036,6 +2057,7 @@ export default function App() {
         )}
         {view === "history" && (
           <HistoryView
+            today={today}
             sessions={sessions}
             settings={settings}
             volume={volume}
