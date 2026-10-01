@@ -328,11 +328,11 @@ function readStored(key, parse, fallback) {
 }
 
 const STORAGE = {
-  async getSessions() {
+  async getSessions(fallback = []) {
     try {
-      return readStored(SESSION_STORAGE_KEY, parseSessions, []);
+      return readStored(SESSION_STORAGE_KEY, parseSessions, fallback);
     } catch {
-      return [];
+      return fallback;
     }
   },
   async saveSessions(sessions) {
@@ -343,11 +343,11 @@ const STORAGE = {
       return false;
     }
   },
-  async getSettings() {
+  async getSettings(fallback = DEFAULT_SETTINGS) {
     try {
-      return readStored(SETTINGS_STORAGE_KEY, parseSettings, DEFAULT_SETTINGS);
+      return readStored(SETTINGS_STORAGE_KEY, parseSettings, fallback);
     } catch {
-      return DEFAULT_SETTINGS;
+      return fallback;
     }
   },
   async saveSettings(settings) {
@@ -1688,7 +1688,7 @@ function SettingsView({ settings, onUpdate, sessions, onResetData, onImportData 
           {[1, 2, 3, 4, 5].map((level) => (
             <button
               key={level}
-              onClick={() => onUpdate({ ...settings, volumeLevel: level })}
+              onClick={() => onUpdate((current) => ({ ...current, volumeLevel: level }))}
               style={{
                 backgroundColor: settings.volumeLevel === level ? COLORS.accent : COLORS.surfaceLight,
                 color: settings.volumeLevel === level ? "#0a0a14" : COLORS.text,
@@ -1734,9 +1734,11 @@ function SettingsView({ settings, onUpdate, sessions, onResetData, onImportData 
                 <select
                   value={dayType}
                   onChange={(e) => {
-                    const newSchedule = [...settings.schedule];
-                    newSchedule[i] = e.target.value;
-                    onUpdate({ ...settings, schedule: newSchedule });
+                    const newType = e.target.value;
+                    onUpdate((current) => ({
+                      ...current,
+                      schedule: current.schedule.map((dt, j) => (j === i ? newType : dt)),
+                    }));
                   }}
                   style={{
                     backgroundColor: COLORS.surfaceLight,
@@ -1950,7 +1952,7 @@ export default function App() {
   const today = useToday();
 
   useEffect(() => {
-    (async () => {
+    const load = async () => {
       const [s, st] = await Promise.all([
         STORAGE.getSessions(),
         STORAGE.getSettings(),
@@ -1958,7 +1960,18 @@ export default function App() {
       setSessions(s);
       setSettings(st);
       setLoaded(true);
-    })();
+    };
+    load();
+    // Every save writes this tab's whole in-memory copy, so a second open tab
+    // would silently overwrite anything logged here with its stale data. The
+    // storage event fires in *other* tabs on each write (key is null on
+    // clear()), so reload whenever another tab changes our data.
+    const onStorage = (e) => {
+      if (e.key === null || e.key === SESSION_STORAGE_KEY || e.key === SETTINGS_STORAGE_KEY)
+        load();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const todaySession = useMemo(
@@ -1973,36 +1986,44 @@ export default function App() {
     [sessions, settings]
   );
 
-  // Callers always supply data.date; logging a session replaces any existing
-  // session on that date.
-  const handleLog = async (data) => {
-    const newSession = { ...data, volumeLevel: settings.volumeLevel };
-    const updated = sessions.filter((s) => s.date !== data.date);
-    updated.push(newSession);
-    updated.sort(byDate);
+  // Edits re-read storage rather than trusting in-memory state: another tab may
+  // have saved since this one last loaded, and its changes must not be lost.
+  // If storage can't be read, fall back to what this tab already has.
+  const updateSessions = async (update) => {
+    const updated = update(await STORAGE.getSessions(sessions));
     setSessions(updated);
     await STORAGE.saveSessions(updated);
   };
+
+  const updateSettings = async (update) => {
+    const updated = update(await STORAGE.getSettings(settings));
+    setSettings(updated);
+    await STORAGE.saveSettings(updated);
+  };
+
+  // Callers always supply data.date; logging a session replaces any existing
+  // session on that date.
+  const handleLog = (data) =>
+    updateSessions((current) =>
+      [
+        ...current.filter((s) => s.date !== data.date),
+        { ...data, volumeLevel: settings.volumeLevel },
+      ].sort(byDate)
+    );
 
   // Swapping affects today only; a null type clears the swap. The weekly
   // schedule is never touched.
-  const handleSwapDay = (newType) => {
-    const overrides = { ...settings.overrides };
-    if (newType === null) delete overrides[today];
-    else overrides[today] = newType;
-    return handleUpdateSettings({ ...settings, overrides });
-  };
+  const handleSwapDay = (newType) =>
+    updateSettings((current) => {
+      const { [today]: _, ...others } = current.overrides;
+      return {
+        ...current,
+        overrides: newType === null ? others : { ...others, [today]: newType },
+      };
+    });
 
-  const handleUndo = async () => {
-    const updated = sessions.filter((s) => s.date !== today);
-    setSessions(updated);
-    await STORAGE.saveSessions(updated);
-  };
-
-  const handleUpdateSettings = async (newSettings) => {
-    setSettings(newSettings);
-    await STORAGE.saveSettings(newSettings);
-  };
+  const handleUndo = () =>
+    updateSessions((current) => current.filter((s) => s.date !== today));
 
   const handleResetData = async () => {
     setSessions([]);
@@ -2070,7 +2091,7 @@ export default function App() {
         {view === "settings" && (
           <SettingsView
             settings={settings}
-            onUpdate={handleUpdateSettings}
+            onUpdate={updateSettings}
             sessions={sessions}
             onResetData={handleResetData}
             onImportData={handleImportData}
