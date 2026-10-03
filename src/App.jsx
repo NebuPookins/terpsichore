@@ -248,6 +248,15 @@ const isISODate = (value) =>
 
 const isLoggableDate = (value, today) => isISODate(value) && value <= today;
 
+// Valid ranges for optional session metrics; null means "not recorded".
+// Out-of-range values silently skew insights (a negative wipeout counts as a
+// recovered session), so both the log form and parseSessions enforce these.
+const WIPEOUT_RANGE = { min: 0, max: 180 };
+const SLEEP_RANGE = { min: 1, max: 5 };
+
+const isIntInRange = (value, { min, max }) =>
+  Number.isInteger(value) && value >= min && value <= max;
+
 // Sessions are stored oldest-first; insights depend on that order.
 const byDate = (a, b) => a.date.localeCompare(b.date);
 
@@ -267,6 +276,21 @@ const isPlainObject = (value) =>
 const ok = (value) => ({ ok: true, value });
 const fail = (error) => ({ ok: false, error });
 
+// Number inputs don't enforce min/max on typed values, and parseInt would read
+// "1e2" as 1 or keep "-5". Blank text means "not recorded"; null means the
+// browser couldn't parse what was typed (see numberInputText).
+function parseOptionalInt(text, range) {
+  if (text?.trim() === "") return ok(null);
+  const n = Number(text ?? NaN);
+  return isIntInRange(n, range)
+    ? ok(n)
+    : fail(`Enter a whole number from ${range.min} to ${range.max}`);
+}
+
+// Older data may hold out-of-range metrics. Rejecting the whole history for one
+// bad number would hide every session, so just treat such a metric as unrecorded.
+const metricOrNull = (value, range) => (isIntInRange(value, range) ? value : null);
+
 function parseSessions(raw) {
   if (!Array.isArray(raw)) return fail("'sessions' must be an array");
   const badIndex = raw.findIndex(
@@ -278,7 +302,15 @@ function parseSessions(raw) {
   );
   if (badIndex !== -1)
     return fail(`session #${badIndex + 1} needs a YYYY-MM-DD date and valid session types`);
-  return ok([...raw].sort(byDate));
+  return ok(
+    raw
+      .map((s) => ({
+        ...s,
+        wipeoutMinutes: metricOrNull(s.wipeoutMinutes, WIPEOUT_RANGE),
+        sleepQuality: metricOrNull(s.sleepQuality, SLEEP_RANGE),
+      }))
+      .sort(byDate)
+  );
 }
 
 function parseSettings(raw) {
@@ -901,6 +933,33 @@ function TodayView({ today, todaySession, settings, volume, onLog, onSwapDay, on
   );
 }
 
+// A number input reports unparseable text (e.g. "5e") as "", which would read
+// as blank; surface it as null so validation can reject it instead.
+const numberInputText = (e) => (e.target.validity.badInput ? null : e.target.value);
+
+// Small caption under a form field; an error replaces the hint when present.
+function FieldHint({ error, hint }) {
+  if (error)
+    return (
+      <div
+        style={{ color: "#fbbf24", fontFamily: "'JetBrains Mono', monospace" }}
+        className="text-xs mt-1 flex items-center gap-2"
+      >
+        <AlertTriangle size={12} />
+        {error}
+      </div>
+    );
+  if (!hint) return null;
+  return (
+    <p
+      style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
+      className="text-xs mt-1"
+    >
+      {hint}
+    </p>
+  );
+}
+
 function LogSessionForm({
   today,
   editableDate = false,
@@ -932,6 +991,10 @@ function LogSessionForm({
   }, [logDate, effectiveDayType]);
 
   const isLiftOrRest = ["rest", "upperLift", "lowerLift"].includes(actualDayType);
+  const tracksDDRMetrics = completed && !isLiftOrRest;
+  const wipeoutResult = tracksDDRMetrics ? parseOptionalInt(wipeout, WIPEOUT_RANGE) : ok(null);
+  const sleepResult = parseOptionalInt(sleepQuality, SLEEP_RANGE);
+  const canSubmit = logDate != null && wipeoutResult.ok && sleepResult.ok;
 
   const handleSubmit = () => {
     onSubmit({
@@ -939,14 +1002,11 @@ function LogSessionForm({
       scheduledDayType,
       actualDayType,
       completed,
-      postSessionRPE: completed && !isLiftOrRest ? rpe : null,
-      wipeoutMinutes:
-        completed && !isLiftOrRest && wipeout !== ""
-          ? parseInt(wipeout, 10)
-          : null,
-      accuracyHeld: completed && !isLiftOrRest ? accuracy : null,
-      performanceQuality: completed && !isLiftOrRest ? performance : null,
-      sleepQuality: sleepQuality !== "" ? parseInt(sleepQuality, 10) : null,
+      postSessionRPE: tracksDDRMetrics ? rpe : null,
+      wipeoutMinutes: wipeoutResult.value,
+      accuracyHeld: tracksDDRMetrics ? accuracy : null,
+      performanceQuality: tracksDDRMetrics ? performance : null,
+      sleepQuality: sleepResult.value,
       notes,
     });
   };
@@ -1156,10 +1216,11 @@ function LogSessionForm({
                 </label>
                 <input
                   type="number"
-                  min="0"
-                  max="180"
-                  value={wipeout}
-                  onChange={(e) => setWipeout(e.target.value)}
+                  min={WIPEOUT_RANGE.min}
+                  max={WIPEOUT_RANGE.max}
+                  step="1"
+                  value={wipeout ?? ""}
+                  onChange={(e) => setWipeout(numberInputText(e))}
                   placeholder="0 = none"
                   style={{
                     backgroundColor: COLORS.surfaceLight,
@@ -1168,12 +1229,10 @@ function LogSessionForm({
                   }}
                   className="w-full p-2"
                 />
-                <p
-                  style={{ color: COLORS.muted, fontFamily: "'JetBrains Mono', monospace" }}
-                  className="text-xs mt-1"
-                >
-                  How long until you felt functional again
-                </p>
+                <FieldHint
+                  error={wipeoutResult.error}
+                  hint="How long until you felt functional again"
+                />
               </div>
 
               <div>
@@ -1238,10 +1297,11 @@ function LogSessionForm({
             </label>
             <input
               type="number"
-              min="1"
-              max="5"
-              value={sleepQuality}
-              onChange={(e) => setSleepQuality(e.target.value)}
+              min={SLEEP_RANGE.min}
+              max={SLEEP_RANGE.max}
+              step="1"
+              value={sleepQuality ?? ""}
+              onChange={(e) => setSleepQuality(numberInputText(e))}
               placeholder="skip if unsure"
               style={{
                 backgroundColor: COLORS.surfaceLight,
@@ -1250,6 +1310,7 @@ function LogSessionForm({
               }}
               className="w-full p-2"
             />
+            <FieldHint error={sleepResult.error} />
           </div>
 
           <div>
@@ -1288,7 +1349,7 @@ function LogSessionForm({
             </button>
             <button
               onClick={handleSubmit}
-              disabled={!logDate}
+              disabled={!canSubmit}
               style={{
                 backgroundColor: COLORS.accent,
                 color: "#0a0a14",
