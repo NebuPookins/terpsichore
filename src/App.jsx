@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Flame,
   Activity,
@@ -1710,23 +1710,29 @@ function SettingsView({ settings, onUpdate, sessions, onResetData, onImportData 
     }
   };
 
-  const handleImport = () => {
+  const handleImport = async () => {
     setImportStatus(null);
+    let backup;
     try {
-      const data = JSON.parse(importText);
-      const backup = parseBackup(data);
-      if (!backup.ok) {
-        setImportStatus({ ok: false, msg: `Invalid format: ${backup.error}` });
-        return;
-      }
-      const { sessions: imported } = backup.value;
-      onImportData(backup.value);
-      setImportStatus({ ok: true, msg: `Imported ${imported.length} session${imported.length !== 1 ? "s" : ""}` });
-      setImportText("");
-      setConfirmImport(false);
+      backup = parseBackup(JSON.parse(importText));
     } catch (e) {
       setImportStatus({ ok: false, msg: `Parse error: ${e.message}` });
+      return;
     }
+    if (!backup.ok) {
+      setImportStatus({ ok: false, msg: `Invalid format: ${backup.error}` });
+      return;
+    }
+    const { sessions: imported } = backup.value;
+    if (!(await onImportData(backup.value))) {
+      // Keep the pasted text so the restore can be retried once space is freed.
+      setImportStatus({ ok: false, msg: "Restored on this page, but couldn't save to browser storage" });
+      setConfirmImport(false);
+      return;
+    }
+    setImportStatus({ ok: true, msg: `Imported ${imported.length} session${imported.length !== 1 ? "s" : ""}` });
+    setImportText("");
+    setConfirmImport(false);
   };
 
   return (
@@ -2001,6 +2007,29 @@ function SettingsView({ settings, onUpdate, sessions, onResetData, onImportData 
   );
 }
 
+function SaveFailedBanner() {
+  return (
+    <div className="px-6 mb-4 max-w-2xl mx-auto">
+      <div
+        role="alert"
+        style={{
+          backgroundColor: COLORS.surface,
+          borderLeft: "3px solid #fbbf24",
+          color: "#fbbf24",
+          fontFamily: "'JetBrains Mono', monospace",
+        }}
+        className="p-3 text-xs flex items-start gap-2"
+      >
+        <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+        <span>
+          COULDN'T SAVE — browser storage is full or disabled. Recent changes will
+          be lost when this page closes. Export a backup from Settings now.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ============================================================
 // MAIN APP
 // ============================================================
@@ -2010,6 +2039,13 @@ export default function App() {
   const [sessions, setSessions] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [loaded, setLoaded] = useState(false);
+  // Values whose save failed (storage full or disabled), keyed by store name.
+  // Saves fail without throwing, so without this the app would look saved
+  // while the data quietly vanished on reload. Held in a ref so edits and
+  // cross-tab reloads see a failure at once, not only after the next render;
+  // the state copy drives the warning banner.
+  const unsavedRef = useRef({});
+  const [unsaved, setUnsaved] = useState({});
   const today = useToday();
 
   useEffect(() => {
@@ -2018,8 +2054,10 @@ export default function App() {
         STORAGE.getSessions(),
         STORAGE.getSettings(),
       ]);
-      setSessions(s);
-      setSettings(st);
+      // Storage is behind this tab for any store whose save failed; reloading
+      // it would silently drop the unsaved change.
+      if (!Object.hasOwn(unsavedRef.current, "sessions")) setSessions(s);
+      if (!Object.hasOwn(unsavedRef.current, "settings")) setSettings(st);
       setLoaded(true);
     };
     load();
@@ -2047,20 +2085,37 @@ export default function App() {
     [sessions, settings]
   );
 
-  // Edits re-read storage rather than trusting in-memory state: another tab may
-  // have saved since this one last loaded, and its changes must not be lost.
-  // If storage can't be read, fall back to what this tab already has.
-  const updateSessions = async (update) => {
-    const updated = update(await STORAGE.getSessions(sessions));
-    setSessions(updated);
-    await STORAGE.saveSessions(updated);
+  const stores = {
+    sessions: { value: sessions, set: setSessions, get: STORAGE.getSessions, save: STORAGE.saveSessions },
+    settings: { value: settings, set: setSettings, get: STORAGE.getSettings, save: STORAGE.saveSettings },
   };
 
-  const updateSettings = async (update) => {
-    const updated = update(await STORAGE.getSettings(settings));
-    setSettings(updated);
-    await STORAGE.saveSettings(updated);
+  // Resolves to whether the value reached storage.
+  const commit = async (name, value) => {
+    const { set, save } = stores[name];
+    set(value);
+    const saved = await save(value);
+    if (saved && !Object.hasOwn(unsavedRef.current, name)) return true;
+    const { [name]: _, ...others } = unsavedRef.current;
+    unsavedRef.current = saved ? others : { ...others, [name]: value };
+    setUnsaved(unsavedRef.current);
+    return saved;
   };
+
+  // Edits re-read storage rather than trusting in-memory state: another tab may
+  // have saved since this one last loaded, and its changes must not be lost.
+  // If storage can't be read, fall back to what this tab already has. After a
+  // failed save storage is *behind* this tab, so re-reading it would discard
+  // the unsaved change — build on that unsaved value instead.
+  const update = async (name, fn) => {
+    const base = Object.hasOwn(unsavedRef.current, name)
+      ? unsavedRef.current[name]
+      : await stores[name].get(stores[name].value);
+    return commit(name, fn(base));
+  };
+
+  const updateSessions = (fn) => update("sessions", fn);
+  const updateSettings = (fn) => update("settings", fn);
 
   // Callers always supply data.date; logging a session replaces any existing
   // session on that date.
@@ -2086,20 +2141,18 @@ export default function App() {
   const handleUndo = () =>
     updateSessions((current) => current.filter((s) => s.date !== today));
 
-  const handleResetData = async () => {
-    setSessions([]);
-    setSettings(DEFAULT_SETTINGS);
-    await STORAGE.saveSessions([]);
-    await STORAGE.saveSettings(DEFAULT_SETTINGS);
+  // Expects a backup already validated by parseBackup. Resolves to whether
+  // everything reached storage.
+  const handleImportData = async (backup) => {
+    const results = await Promise.all([
+      commit("sessions", backup.sessions),
+      commit("settings", backup.settings),
+    ]);
+    return results.every(Boolean);
   };
 
-  // Expects a backup already validated by parseBackup.
-  const handleImportData = async ({ sessions: importedSessions, settings: importedSettings }) => {
-    setSessions(importedSessions);
-    setSettings(importedSettings);
-    await STORAGE.saveSessions(importedSessions);
-    await STORAGE.saveSettings(importedSettings);
-  };
+  const handleResetData = () =>
+    handleImportData({ sessions: [], settings: DEFAULT_SETTINGS });
 
   if (!loaded) {
     return (
@@ -2124,6 +2177,7 @@ export default function App() {
       }}
     >
       <Header view={view} setView={setView} today={today} />
+      {Object.keys(unsaved).length > 0 && <SaveFailedBanner />}
 
       <div className="pb-12 max-w-2xl mx-auto">
         {view === "today" && (
